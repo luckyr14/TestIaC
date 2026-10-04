@@ -1,2 +1,0 @@
-# TestIaC
-IaC Task 

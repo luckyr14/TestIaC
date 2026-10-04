@@ -1,295 +1,235 @@
-# Infrastructure Code — Notes & Step-by-Step Guide
+# DevOps Assignment: Notes
 
-## Directory Structure
+Order of work: **Task 2 (backend bootstrap) -> Task 1 (EC2 module)** -> Tasks 3, 4, 5 (written answers only).
 
 ```
-InfrasturctureCode/
-├── modules/ec2-multi-instance/   Task 1 — reusable EC2 module
-├── 00-bootstrap/                 Task 2 prereq — creates S3 + DynamoDB
-├── main.tf + variables.tf + ...  Tasks 1+2 — root: VPC + EC2 fleet (remote backend)
-├── backend.hcl                   Task 2 — partial backend config (update after bootstrap)
-├── iam/                          Task 3 — multi-account IAM
-├── ci-policy/                    Task 4 — least-privilege CI policy
-├── bugfix/                       Task 5 — fixed roleC Terraform
-└── NOTES.md
+01-backend-bootstrap/   Task 2: creates S3 bucket + DynamoDB lock table
+02-ec2-module/          Task 1: module + root config using that backend
+NOTES.md
 ```
 
----
-
-## Step-by-Step: Running from Scratch
-
-### Prerequisites
-```
-brew install terraform        # or: https://developer.hashicorp.com/terraform/install
-aws configure                 # enter Access Key, Secret Key, region=us-east-1
-terraform version             # confirm >= 1.5
-```
-
-Your IAM user/role needs: `AmazonEC2FullAccess`, `AmazonVPCFullAccess`,
-`AmazonS3FullAccess`, `AmazonDynamoDBFullAccess`, `IAMFullAccess`.
-
----
-
-### Step 1 — Bootstrap remote state (Task 2 prerequisite)
-
+**How to run**
 ```bash
-cd 00-bootstrap
-terraform init
-terraform apply
-# Type 'yes' when prompted.
-```
-
-Note the printed `state_bucket` output value (looks like `tf-state-infra-123456789012`).
-
----
-
-### Step 2 — Update backend.hcl
-
-Open `backend.hcl` and replace `REPLACE_WITH_YOUR_ACCOUNT_ID` with the actual
-account ID (12-digit number) printed in the bootstrap output:
-
-```
-bucket = "tf-state-infra-123456789012"   ← replace this line
+cd 01-backend-bootstrap && terraform init && terraform apply -var state_bucket_name=<unique-name>
+# put that bucket name into 02-ec2-module/backend.tf
+cd ../02-ec2-module && terraform init && terraform plan && terraform apply
 ```
 
 ---
 
-### Step 3 — Deploy VPC + EC2 fleet (Tasks 1 + 2)
+## Task 2: Remote State & Locking
 
-```bash
-cd ..        # back to InfrasturctureCode/
-terraform init -backend-config=backend.hcl
-terraform plan
-terraform apply
-# Type 'yes' when prompted.
-```
+**What was added**
+- `01-backend-bootstrap/`: an S3 bucket (versioned, encrypted, public access blocked, `prevent_destroy`) and a DynamoDB table with hash key `LockID`.
+- `02-ec2-module/backend.tf`: a `backend "s3"` block with `dynamodb_table` and `encrypt = true`.
+- The bootstrap is a separate config because a backend cannot create its own storage. It is applied once with local state, and everything else then uses the remote backend.
 
-Expected output at the end:
-```
-instance_ids = {
-  "app-server"   = "i-0abc..."
-  "cache-server" = "i-0def..."
-  "db-server"    = "i-0ghi..."
-  "web-server"   = "i-0jkl..."
-  "worker"       = "i-0mno..."
-}
-private_ips = { ... }
-public_ips  = { ... }
-```
+**What happens today (local state) if two people apply at the same time**
+- Local state lives in a `terraform.tfstate` file on each person's machine. There is no shared source of truth and no lock.
+- If each person has their own copy, both plans are computed against stale or different state. Both applies create the same resources (duplicate instances, name conflicts), or one tries to modify something the other is deleting.
+- If the file is shared (git, a shared drive), the last writer overwrites the other's changes. State then no longer matches real infrastructure, which leads to orphaned resources, drift, or a corrupted file.
 
-**Verify prevent_destroy works:**
-```bash
-terraform destroy -target='module.ec2_fleet.aws_instance.protected["db-server"]'
-# Terraform will error: "Instance cannot be destroyed" — that is correct.
-```
+**How the backend change prevents it**
+- When `apply` starts, Terraform writes a lock item (`LockID` = `<bucket>/<key>`) to DynamoDB using a **conditional write** that only succeeds if the item does not already exist. DynamoDB guarantees that only one caller wins.
+- The second person gets `Error acquiring the state lock`, showing who holds it, the operation, and when it started. They can wait using `-lock-timeout=5m`.
+- The lock is released when the apply finishes. `terraform force-unlock <ID>` exists for a crashed run, and should be used carefully.
+- State is stored once in S3, so everyone sees the same state. Versioning lets you recover an earlier state after a bad write.
+- Note: Terraform 1.10+ also supports `use_lockfile = true` (S3-native locking, no DynamoDB), and DynamoDB locking is being deprecated. DynamoDB is used here because the assignment asks for it.
 
 ---
 
-### Step 4 — Deploy IAM (Task 3)
+## Task 1: Multi-Instance EC2 Provisioning
 
-```bash
-cd iam
-terraform init
-terraform plan
-terraform apply
-```
+| Name   | Type      | Root volume        | Key pair   | Protected |
+|--------|-----------|--------------------|------------|-----------|
+| web    | t3.micro  | gp3, 20 GB         | key-web    |           |
+| api    | t3.small  | gp3, 30 GB         | key-api    |           |
+| worker | t3.medium | gp2, 40 GB         | key-worker |           |
+| cache  | r5.large  | gp3, 50 GB, 4000 iops | key-cache |        |
+| db     | m5.large  | **io2**, 100 GB, 3000 iops | key-db | **yes** |
 
-This creates users `engine`, `ci`, `alice`, `bob`; groups `group1` and `group2`;
-`roleA` (admin except IAM); `roleB` (assume-roleC-only); and `roleC` in Account B.
+- One input variable, `instances` (`map(object(...))`), drives everything through `for_each`. No hardcoded per-instance resource blocks.
+- Every instance is tagged `Name` (the map key), `Environment`, and `Owner`.
+- Validation rules enforce exactly 5 instances, at least one io1/io2 volume, `iops` set for io1/io2, and exactly one protected instance.
+- Outputs: `instance_ids` (name -> ID) and `instance_private_ips` (name -> private IP).
+- Key pairs must already exist in the region.
 
-**For single-account testing** (default) both `account_a` and `account_b` providers
-use your current credentials — `roleC` will be in the same account as roleA/B.
-To use two real accounts, edit `providers.tf` and add an `assume_role` block
-to the `account_b` provider.
-
----
-
-### Step 5 — Deploy CI policy (Task 4)
-
-```bash
-cd ../ci-policy
-# The JSON template substitutes ACCOUNT_ID with your real account ID automatically.
-terraform init
-terraform apply
-```
+**Which instance is protected and why: `db`**
+- It is the stateful, hardest-to-recreate machine, and its io2 volume holds data that cannot be rebuilt from code. The others are stateless and can be recreated from the module.
+- `prevent_destroy = true` makes `terraform destroy`, or any change that forces a replacement, fail with an error instead of deleting it.
+- **Design note:** `prevent_destroy` must be a literal `true`, not a variable or `each.key`. So the map is split into `protected` and `normal` using a `protected` flag, with two `aws_instance` resources and the lifecycle block on only one. The outputs `merge()` both.
+- Limitation: it only protects against Terraform. Someone deleting the instance in the console or CLI is not stopped. For that, also enable EC2 termination protection (`disable_api_termination`).
 
 ---
 
-### Step 6 — Review the bugfix (Task 5)
+## Task 3: Multi-Account IAM & Cross-Account Access (design)
 
-No apply needed — this is a reference file showing the fixed code with
-annotated explanations of both bugs.
-
-```bash
-cat ../bugfix/main.tf
-```
-
----
-
-### Step 7 — Teardown (to avoid charges)
-
-```bash
-# EC2 fleet first (remove prevent_destroy before destroying db-server)
-cd ..
-terraform destroy    # will fail on db-server — that is the lifecycle guard working
-
-# To actually destroy everything including db-server:
-# Edit modules/ec2-multi-instance/main.tf → change prevent_destroy = false → then:
-terraform destroy
-
-# IAM
-cd iam && terraform destroy
-
-# CI policy
-cd ../ci-policy && terraform destroy
-
-# Bootstrap last (destroy EC2/state consumers before removing the state bucket)
-cd ../00-bootstrap && terraform destroy   # will fail due to prevent_destroy on bucket
-# Remove prevent_destroy from 00-bootstrap/main.tf first, then re-run.
-```
-
----
-
-## Task 1 — Protected Instance
-
-**Which instance:** `db-server`
-
-**Why:** It is the only instance using an `io2` root volume — chosen for high-IOPS
-database workloads. Accidental deletion destroys the volume and all data on it unless
-a snapshot was taken first. For the other four instances (web, app, cache, worker),
-re-creating them from the same AMI restores full functionality because they are
-stateless. A database has no such fast recovery path.
-
-**Why two `for_each` resource blocks instead of one:**
-Terraform's `lifecycle` block is a *meta-argument*. It is evaluated at plan time
-before any expression values are known — it cannot reference `each.key`, variables,
-or any dynamic value. The only way to apply `prevent_destroy = true` to one specific
-instance while driving the rest from a map is to split the map into two resource
-blocks: `aws_instance.standard` (all instances except the protected one) and
-`aws_instance.protected` (the one instance with `prevent_destroy = true`).
-
----
-
-## Task 2 — Remote State and Locking
-
-### What happens without a backend (two concurrent applies)
-
-With local state each engineer has their own `terraform.tfstate` on disk.
-When two people run `terraform apply` at the same time:
-
-1. Both read their local state — which may already be stale relative to what the
-   other person applied previously.
-2. Both generate plans independently, unaware of the other's changes.
-3. Both apply concurrently. Depending on timing:
-   - The second apply may re-create resources the first just made (duplicates).
-   - It may delete resources the first just created (because its plan said to).
-   - Whichever apply finishes last overwrites the state file, silently dropping
-     resources tracked only by the first run.
-
-The result is **diverged infrastructure and a corrupted or incomplete state file**,
-with no error from Terraform — it has no way to detect the conflict.
-
-### How S3 + DynamoDB prevents this
-
-**S3** stores a single shared state file. Every `terraform init` points all engineers
-at the same object — one source of truth.
-
-**DynamoDB** provides a distributed lock. When an `apply` (or `plan`) starts,
-Terraform writes a `LockID` item to the DynamoDB table using a conditional put
-(succeeds only if the item does not already exist). A concurrent `apply` reads the
-lock, sees it is held, and immediately fails with a descriptive error naming the
-lock holder and timestamp. The lock is released when the operation finishes normally
-or is force-unlocked with `terraform force-unlock`.
-
----
-
-## Task 3 — IAM Questions
-
-### 1. Would you give engine and ci IAM users with access keys in production?
-
-No. Long-lived static access keys are a persistent secret that can be leaked
-through git history, CI environment variable dumps, or log files, and remain
-valid indefinitely unless actively rotated.
-
-**For `ci`:** Use OIDC federation. GitHub Actions, GitLab CI, and CircleCI all
-support issuing a short-lived OIDC token per job. The pipeline exchanges the OIDC
-token for temporary AWS credentials via `sts:AssumeRoleWithWebIdentity`. No static
-key exists at rest anywhere — not in the repo, not in CI secrets.
-
-**For `engine`:** Remove the IAM user entirely. Engineers authenticate via AWS
-IAM Identity Center (SSO) with MFA and assume a role for their session. Credentials
-expire automatically (hours, not never), and all access is centrally auditable in
-CloudTrail.
-
-IAM users with access keys are a legacy pattern. They should not be created for
-new production workloads.
-
-### 2. Trusting Account A root vs. roleB's specific ARN in roleC's trust policy
-
-**Trusting `arn:aws:iam::ACCOUNT_A:root`** delegates access control entirely to
-Account A. Any principal in Account A that has been granted `sts:AssumeRole` on
-roleC's ARN via Account A's own IAM policies can assume it. Account B has no
-independent control over *who* in Account A can get in.
-
-**Trusting `arn:aws:iam::ACCOUNT_A:role/roleB` specifically** means roleC can only
-ever be assumed by that exact principal — not by Account A admins, not by the root
-user, not by any other role in Account A, even if those principals have been granted
-`sts:AssumeRole` permissions internally.
-
-Practical consequence: if Account A is misconfigured or compromised, trusting the
-root means any high-privilege Account A identity can immediately pivot into Account B.
-Trusting only roleB's ARN contains that blast radius to the single role. For
-cross-account access to sensitive resources, always trust the specific ARN.
-
----
-
-## Task 4 — Deliberate Omissions from the CI Policy
-
-| Excluded | Reason |
-|---|---|
-| `ecr:CreateRepository`, `ecr:DeleteRepository` | CI pushes to an existing repo; it does not provision ECR |
-| `ecr:SetRepositoryPolicy`, `ecr:PutLifecyclePolicy` | CI does not configure the registry |
-| `ecs:CreateService`, `ecs:DeleteService`, `ecs:CreateCluster` | CI deploys to an existing service; infrastructure lifecycle is IaC |
-| `ecs:RunTask`, `ecs:StopTask` | CI updates the service task definition; it does not schedule ad-hoc tasks |
-| `s3:PutObject`, `s3:DeleteObject` on the artifact bucket | The artifact bucket is read-only from CI; writes happen in a separate upload step |
-| `s3:PutBucketPolicy`, `s3:GetBucketAcl` | CI reads objects, not bucket metadata or policy |
-| `iam:CreateRole`, `iam:AttachRolePolicy` | CI must never be able to escalate its own privileges |
-| Wildcard `iam:PassRole` | `iam:PassRole` is included but locked to a single role ARN and constrained with `Condition: iam:PassedToService = ecs-tasks.amazonaws.com` — prevents passing that role to any other AWS service |
-
----
-
-## Task 5 — Bug Explanation
-
-The broken snippet had two independent bugs:
-
-### Bug 1 — Trust policy: `user/roleB` instead of `role/roleB`
-
-```hcl
-# BROKEN:
-identifiers = ["arn:aws:iam::000000000000:user/roleB"]
-
-# FIXED:
-identifiers = ["arn:aws:iam::000000000000:role/roleB"]
-```
-
-roleB is an IAM **Role**. The ARN path for roles is `role/`; for users it is `user/`.
-No IAM user named `roleB` exists in Account A, so AWS evaluates the trust policy,
-finds no matching entity, and rejects every `sts:AssumeRole` call with `AccessDenied`.
-The failure is silent — AWS gives no hint that the principal type in the ARN is wrong.
-
-### Bug 2 — Permissions policy: `Resource = "*"` is too broad
+**Account A (000000000000)**
+- `group1` (programmatic only): users `engine` and `ci`. No console login profile, so access keys only.
+- `group2` (console + CLI): users `alice` and `bob`, with console passwords (forced reset) and MFA.
+- `roleA`: a single statement with `Effect: Allow`, `NotAction: "iam:*"`, `Resource: "*"`. That gives administrative access to everything except IAM. Its trust policy allows group2 users (with MFA) to assume it.
+- `roleB`: its only permission is to assume roleC.
 
 ```json
-// BROKEN:
-{ "Action": "s3:*", "Resource": "*" }
-
-// FIXED (two statements):
-{ "Action": ["s3:ListBucket", "s3:GetBucketLocation"], "Resource": "arn:aws:s3:::my-bucket" }
-{ "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], "Resource": "arn:aws:s3:::my-bucket/*" }
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": "sts:AssumeRole",
+    "Resource": "arn:aws:iam::111111111111:role/roleC"
+  }]
+}
 ```
 
-`Resource = "*"` grants full S3 access to every bucket in Account B. The requirement
-is access to *one named bucket*. Two ARN forms are needed because AWS splits
-bucket-level operations (e.g., `ListBucket` — requires the bucket ARN without a path)
-from object-level operations (e.g., `GetObject` — requires `bucket/*`). Using only
-one form silently breaks either listing or object access.
+**Account B (111111111111)**
+- `roleC`: full access to one bucket (`my-shared-bucket`), trusted only by roleB (see Task 5 for the trust and permission policies).
+- Cross-account access needs **both sides**: roleB's identity policy allows `sts:AssumeRole` on roleC, and roleC's trust policy allows roleB.
+
+**1. Would I give `engine` and `ci` IAM users with access keys in real production?**
+No. Long-lived access keys are the most commonly leaked credential type. They do not expire, they end up in repos, logs and laptops, and they are hard to rotate and audit per person or job. I would use:
+- **CI:** OIDC federation (for example GitHub Actions or GitLab to an IAM role with `AssumeRoleWithWebIdentity`). Credentials are short-lived and scoped to a repo/branch through the trust policy's `sub` condition.
+- **Humans and "engine" style accounts:** IAM Identity Center (SSO) with short-lived sessions, or roles assumed from a central identity.
+- **Workloads:** instance profiles, ECS task roles, or IRSA, never keys.
+- If keys are unavoidable: least-privilege policy, MFA or IP/condition restrictions, 90-day rotation, secrets manager storage, and alerts on use.
+
+**2. In roleC's trust policy, trusting Account A root vs. roleB's ARN**
+- Trusting `arn:aws:iam::000000000000:root` means "anyone in Account A the admin of Account A chooses to allow." Any user or role in Account A that has `sts:AssumeRole` permission on roleC can assume it. That includes roleA (admin), CI users, and any compromised or future principal. Security then depends on Account A's IAM hygiene, which Account B does not control.
+- Trusting `.../role/roleB` means only that one role can assume it. Even an admin in Account A cannot use roleC without going through roleB.
+- It is least privilege at the trust boundary: Account B defines exactly who may enter, instead of delegating that decision to another account.
+
+---
+
+## Task 4: Least-Privilege Policy for `ci`
+
+Placeholders: region `ap-south-1`, account `000000000000`, repo `my-app`, cluster `my-cluster`, service `my-service`, bucket `my-build-artifacts`. Replace with real values.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EcrLogin",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcrPushToOneRepo",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage"
+      ],
+      "Resource": "arn:aws:ecr:ap-south-1:000000000000:repository/my-app"
+    },
+    {
+      "Sid": "EcsTaskDefinitions",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:RegisterTaskDefinition",
+        "ecs:DescribeTaskDefinition"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcsDeployToOneService",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:UpdateService",
+        "ecs:DescribeServices"
+      ],
+      "Resource": "arn:aws:ecs:ap-south-1:000000000000:service/my-cluster/my-service"
+    },
+    {
+      "Sid": "PassOnlyTheTaskRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::000000000000:role/my-app-task-role",
+        "arn:aws:iam::000000000000:role/my-app-task-execution-role"
+      ],
+      "Condition": {
+        "StringEquals": { "iam:PassedToService": "ecs-tasks.amazonaws.com" }
+      }
+    },
+    {
+      "Sid": "ReadArtifactsBucketList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-build-artifacts"
+    },
+    {
+      "Sid": "ReadArtifactsObjects",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::my-build-artifacts/*"
+    }
+  ]
+}
+```
+
+**Why a few things use `Resource: "*"`:** `ecr:GetAuthorizationToken`, `ecs:RegisterTaskDefinition` and `ecs:DescribeTaskDefinition` do not support resource-level permissions, so `*` is the only option. Everything that can be scoped is scoped.
+
+**What I deliberately left out, and why**
+- **`ecr:*` / pull actions (`BatchGetImage`, `GetDownloadUrlForLayer`):** CI only pushes. Pulling is done by the ECS execution role, not CI.
+- **`ecr:CreateRepository`, `DeleteRepository`, `BatchDeleteImage`:** CI must not create or destroy repos or delete images.
+- **`ecs:*`, `CreateService`, `DeleteService`, `RunTask`, `DeregisterTaskDefinition`, cluster actions:** the job is only to roll out a new revision to an existing service. No creating or deleting infrastructure.
+- **`s3:PutObject`, `DeleteObject`, `s3:*`:** the requirement says read-only. Write access would let a compromised pipeline tamper with build artifacts.
+- **Wildcard bucket/repo ARNs and `Resource: "*"` on S3/ECR/ECS actions:** scoped to single named resources to limit blast radius.
+- **`iam:PassRole` on `*`:** a wide-open PassRole is a classic privilege-escalation path. It is restricted to the two task roles and to `ecs-tasks.amazonaws.com`. It is also easy to forget, and without it `RegisterTaskDefinition`/`UpdateService` fails.
+- **`iam:*`, `sts:*`, `logs:*`, `cloudformation:*`, `ec2:*`:** not needed for these three jobs.
+
+---
+
+## Task 5: Find and Fix the Bug
+
+**Fixed code**
+```hcl
+data "aws_iam_policy_document" "roleC_trust" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::000000000000:role/roleB"]   # role/, not user/
+    }
+  }
+}
+
+resource "aws_iam_role" "roleC" {
+  name               = "roleC"
+  assume_role_policy = data.aws_iam_policy_document.roleC_trust.json
+}
+
+resource "aws_iam_role_policy" "roleC_s3" {
+  name = "roleC-s3-access"
+  role = aws_iam_role.roleC.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = "s3:*"
+      Resource = [
+        "arn:aws:s3:::my-shared-bucket",     # bucket-level actions (ListBucket, etc.)
+        "arn:aws:s3:::my-shared-bucket/*"    # object-level actions (Get/Put/Delete)
+      ]
+    }]
+  })
+}
+```
+
+**Bug 1, trust policy: wrong principal type (`user/roleB` instead of `role/roleB`)**
+- The ARN says "an IAM *user* named roleB in Account A", but roleB is an IAM *role*. The ARN path is part of the identity, so `user/roleB` is a different identity from `role/roleB`.
+- Consequence: when the trust policy is saved, IAM checks the principal and either rejects it (`MalformedPolicyDocument: Invalid principal in policy`) because no such user exists, or, if a user with that name ever exists, it would trust the wrong identity. roleB itself could never assume roleC, because its ARN does not match.
+- Fix: use `arn:aws:iam::000000000000:role/roleB`. If roleB has a path (for example `role/team/roleB`), the path must be included.
+
+**Bug 2, permissions policy: `s3:*` on `Resource = "*"`**
+- This grants every S3 action on **every bucket in Account B**, not the single named bucket the requirement calls for. It breaks least privilege, and anyone who assumes roleC could read, overwrite, or delete any bucket in that account.
+- Fix: scope to the bucket ARN (for bucket-level actions like `s3:ListBucket`) **and** `bucket/*` (for object-level actions like `GetObject`/`PutObject`). Both entries are needed, since bucket actions apply to the bucket ARN and object actions to the `/*` ARN.
+
+**Also remember:** even with the trust policy fixed, roleB must have its own identity policy allowing `sts:AssumeRole` on `arn:aws:iam::111111111111:role/roleC` (see Task 3). Cross-account access needs permission on both sides.
